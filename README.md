@@ -1,0 +1,349 @@
+# MiHome-Windows
+
+米家设备的 Windows 桌面控制端。基于 [mijiaAPI](https://github.com/Do1e/mijia-api)
+构建图形界面，扫码登录后即可在本地窗口中查看和控制家里的全部米家设备。
+
+> **注意：当前项目仍处于早期版本。** 作者个人米家设备有限，无法对各类设备做针对性适配测试，因此 UI 和操作逻辑的完善度不算很高。不过基础使用（扫码登录、设备列表与常用控制、托盘、小爱语音等）已无大碍，但需适配更多设备功能则需要社区支持了。
+
+## macOS 移植版
+
+此版本由 Jonathan5345 在 [MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows) 基础上修改，增加 macOS 支持。修改日期为 2026-11-08，按 GPL-3.0 或更高版本发布。
+
+使用 macOS 原生窗口边框。开启设置里的系统托盘后，可从菜单栏米家图标选择「显示主窗口」或「快捷控制」。首次使用时，用手机米家 App 扫描登录二维码。
+
+在 macOS 上从源码运行（Python 3.10 或更新版本）：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/python run.py
+```
+
+构建当前架构的 `dist/MiHome.app`：
+
+```bash
+.venv/bin/python -m pip install pyinstaller
+bash build-macos.sh
+```
+
+设置和日志位于 `~/Library/Application Support/MiHome/`，扫码凭据沿用 mijiaAPI 的 `~/.config/mijia-api/auth.json`。macOS 构建暂未接入自动更新，可在系统设置的「登录项」中添加应用。桌面挂件在 macOS 上按 Qt 窗口层级显示。
+
+**登录与网络**：只有本地没有凭据、或服务器明确拒绝凭据时才会弹扫码。会话校验、刷新凭据或加载设备遇到超时/连接被重置/代理错误时，凭据原样保留，主窗口提示失败的阶段与域名，并按 30 秒、1 分钟、2 分钟、5 分钟自动重试，也可点右上角刷新立即重试。只读请求在用户操作中最多重试一次；开关、动作、场景等写请求从不自动重发（开机卡这类「按一下」的设备被按两次会开了又关）。`debug.log` 按阶段记录「会话校验 / 刷新登录凭据 / 家庭列表 / 设备列表 / 共享设备列表」的结果、主机名与用时，不记录 URL 参数、Cookie 或 Token。
+
+米家云端接口在 `api.mijia.tech`（会话校验、设备列表与控制）和 `sts.api.mijia.tech`（刷新凭据、扫码回调），扫码页在 `account.xiaomi.com`。如果日志里反复出现这两个域名的超时或「代理连接失败」，说明本机到它们的线路有问题（例如被代理规则分到了较慢的节点），程序层面只能等待和重试。
+
+米家服务器在国内，用 Shadowrocket 这类规则代理时，建议让 `api.mijia.tech`、`sts.api.mijia.tech`（或整个 `mijia.tech`）走 DIRECT。规则要放在会把它们分到代理的规则之前，改完后完全退出应用再重新打开，已建立的连接不会因为改了规则而换线路。实测（2026-11，同一网络、未带凭据的握手计时）：经代理节点建立加密连接需要 3–18 秒，并时有失败；直连约 0.05 秒。改为直连后，会话校验和每一步设备加载都只要约 0.1 秒。
+
+**菜单栏驻留**：开启设置里的「菜单栏常驻与快捷操作面板」后，点红色关闭按钮只隐藏窗口，应用继续在菜单栏运行；可从菜单栏图标的「显示主窗口」或点 Dock 图标重新打开。按 ⌘Q、Dock 菜单「退出」或菜单栏图标里的「退出」会真正退出（窗口隐藏时也一样）。关闭该设置后，关闭窗口即退出应用。
+
+**控制中心控件（macOS 26 及以上）**：在控制中心底部「编辑控制…」里添加 MiHome 的「米家设备开关」，系统会让你从家庭里选一台设备；之后点控件直接开关，开关状态与高亮跟随设备实际状态，不必打开主窗口。MiHome 需要在运行（可只驻留菜单栏）：控件本身没有米家凭据，所有操作都交给已登录的主程序完成；没运行时控件显示「MiHome 未运行」。设备列表在登录后从米家读取。支持开关的开机卡也会出现在列表里，点按相当于按下电脑电源键。构建时需要一个 Apple 开发者团队的签名身份，App Group 必须以该团队的 Team ID 开头：
+
+```bash
+MIHOME_CONTROL_GROUP=<TeamID>.io.github.huanyuejue.mihome \
+MIHOME_SIGN_IDENTITY="Apple Development: …" bash build-macos.sh
+```
+
+- 每次构建都会写入新的构建号（`CFBundleVersion`，可用 `MIHOME_BUILD_NUMBER` 指定）。系统按版本号缓存控件描述，版本号不变时重新安装也会沿用旧描述（例如不弹设备选择）。
+- 覆盖安装后执行 `killall MiHomeControls`：系统会一直复用已在运行的扩展进程，不结束它就还是旧代码在应答（实测新加的「家庭」选项因此打不开）。系统下次需要时会自动用新版重新启动扩展。
+- 主程序必须经 `containerURL(forSecurityApplicationGroupIdentifier:)` 取得组容器（见 `app/core/app_group.py`）。macOS 15 起，自己拼路径会被当成访问其他应用的数据：每次启动都弹「想要访问其他 App 的数据」，弹窗期间主线程卡住，拒绝后控件静默失效。
+- 通信协议见 `app/ui/control_center_bridge.py`，`debug.log` 里以「控制中心：」开头的行记录选择列表、开关与失败原因。
+
+## 功能
+
+- **扫码登录**：米家 APP 扫二维码，登录凭据与上游依赖的 CLI 共用
+- **设备列表**：按家庭、房间分组，实时显示在线状态；可在设置里隐藏「无控制功能」或「离线」的设备；设备名过长时自动折成两行并在末尾省略，完整名称见鼠标提示
+- **房间标签**：顶部标签支持拖拽排序，可指定某个标签作为启动后默认打开的页面；标签过多时自动换行，不会挤出屏幕
+- **自定义名称**：详情页标题旁可改设备名，只存本地、不影响手机端；改过的设备带「自定义名称」标记，可一键恢复云端原名。无公开规格的设备（仅蓝牙类）同样支持
+- **卡片外显值**：设备卡片副标题默认显示温度与湿度，可在详情页改成任意可读数值（如插座的功率），最多两项，也可以选择完全不显示
+- **环境概览**：房间栏下方一行状态胶囊，显示当前范围的温度、湿度、开启设备数与耗材不足数量，点击查看明细（设备卡片可直接开关）
+- **场景执行**：主页「场景」选项卡列出米家 APP 中创建的手动场景，一键执行（可在设置中隐藏该入口）
+- **定时开关**：给指定设备配「每天某时刻打开/关闭」，同一设备可配多条（如 7:00 开灯、23:00 关灯）；到点自动执行并提示，错过时间不补执行只提醒。**需应用保持运行**（最小化到托盘也算），关掉程序不会触发
+- **设备控制**：根据设备 spec 元数据自动生成控件——布尔属性映射开关、数值属性映射滑块（自动套用范围与步长）、枚举属性映射下拉框
+- **动作执行**：设备支持的动作渲染为按钮，执行前二次确认
+- **系统托盘**：最小化到托盘，左键单击切换快捷控制窗口、双击直接唤出主窗口；支持快捷设备控制、场景一键执行、小爱音响快捷控制、小爱语音指令，快捷窗口支持单列/双列卡片切换与设备/场景混排排序
+- **桌面挂件**：常驻桌面的设备控制面板——自选放哪些设备与场景、无级调透明度、单排最多放 9 张设备卡片、一键收起为细横条、背景色可调；窗口可置顶可锁定；开关在「设置 → 应用功能 → 桌面挂件」，开启后随应用启动自动显示；设备清单与托盘快捷窗口相互独立，卡片顺序可直接在面板上拖动调整
+- **定时任务**：针对具体设备定时设置开启、关闭
+- **虚拟开关支持**：针对多键开关虚拟的独立开关支持独立控制
+- **主题配色**：深色 / 浅色 / 跟随系统；**控件主题色可自定义**（内置绿/粉/黄/蓝四档，也可打开取色板任选颜色，按钮、开关、选中态与浮窗统一跟随）
+- **托盘图标配色**：默认跟随 Windows 任务栏深浅色自动切换，也可固定为黑、白、绿或任意自定义颜色
+- **交互细节**：滚轮采用缓动动画（不再是逐条跳变）、工具提示按应用主题自绘（系统深色模式下不再黑底深字）、弹出面板统一淡入淡出
+- **界面缩放**：50%–200% 无级调节（叠加在系统缩放之上），需重启生效
+- **开机自启动**：可选，写入当前用户注册表（HKCU Run）
+- **小爱语音**：主界面右下角悬浮按钮，输入文字指令发送给在线小爱音箱，可指定默认输出音箱
+- **版本检测**：启动时自动检查 GitHub Releases 新版本，也可在关于页手动检测
+- **本地缓存**：设置、托盘/工作台配置与设备缓存存放在用户数据目录（详见下方路径说明）
+- **上游可升级**：mijiaAPI 仅作为 PyPI 依赖锁定在 `>=5,<6`，升级后跑 `python -m tests.smoke_test` 即可确认兼容性
+
+## 运行
+
+要求 Python >= 3.10
+
+### 一键运行
+
+```powershell
+git clone https://github.com/huanyuejue/MiHome-Windows.git
+cd MiHome-Windows
+
+# 双击 start.bat，或命令行执行：
+start.bat
+```
+
+`start.bat` 自动完成：创建 venv → 安装依赖 → 启动程序，无需手动配置环境。
+
+### 手动运行
+
+```powershell
+git clone https://github.com/huanyuejue/MiHome-Windows.git
+cd MiHome-Windows
+
+python -m venv .venv
+.venv\Scripts\pip install -e .
+.venv\Scripts\python.exe run.py
+```
+
+首次启动会弹出扫码窗口；之后凭据长期复用，失效时再次扫码即可。
+
+源码模式下运行日志会同时写入项目根的 `debug.log`（结构化）与 `app.log`
+（控制台原始输出 + 崩溃堆栈），排查问题时两个都值得看。
+
+## 本地缓存与数据存储
+
+程序运行时会在以下位置生成配置和缓存文件，方便用户备份或排查问题：
+
+### 应用数据（Releases版）
+
+路径：`%LOCALAPPDATA%\MiHome-Windows\`
+
+| 文件 | 说明 |
+|------|------|
+| `settings.json` | 应用设置（主题、缩放、托盘、自启动等） |
+| `tray.json` | 托盘快捷控制面板的设备/场景配置与显示顺序 |
+| `workbench.json` | 工作台（设备详情页）的自定义布局 |
+| `board.json` | 桌面挂件配置（启用开关、设备/场景列表与顺序、每行列数、透明度、位置尺寸、折叠态、背景色、是否置顶、是否锁定） |
+| `schedules.json` | 定时开关规则（设备、时刻、动作、是否启用、最后执行日期） |
+| `devices_cache.json` | 设备列表与状态缓存，启动时优先从缓存加载以加快首屏显示 |
+| `device_names.json` | 自定义设备名称（设备 ID → 名称），只影响本机显示 |
+| `product_names.json` | 从产品页解析到的中文商品名缓存，解析成功才写入 |
+| `device_icons.json` / `icons/` | 设备图标 URL 映射与图片文件缓存 |
+| `debug.log` | 结构化运行日志（异常、后台失败、云端错误码） |
+| `app.log` | 控制台原始输出与崩溃堆栈，**仅源码模式生成**，详见下方排查说明 |
+
+> 路径中的 `%LOCALAPPDATA%` 通常为 `C:\Users\<用户名>\AppData\Local`。
+> 旧版曾写在 exe 同目录，首次启动会自动迁移至此。
+
+### 应用数据（源码模式）
+
+路径：项目根目录（与 `run.py` 同级），文件名与 Releases 版一致
+
+### 米家账号登录凭据
+
+路径：`~/.config/mijia-api/auth.json`
+
+这是 mijiaAPI 的认证文件，扫码登录后长期复用。失效时程序会自动提示重新扫码。
+
+> 路径中的 `~` 在 Windows 上为 `C:\Users\<用户名>`。
+
+**卸载重装为什么不用重新扫码？** 因为凭据不在安装目录、也不在
+`%LOCALAPPDATA%\MiHome-Windows` 里：卸载程序只会问要不要删后者，`auth.json`
+始终保留。所以「卸载 → 重装 → 打开已是登录态」是预期行为。想验证全新安装的流程，
+把 `auth.json` 临时改名（如 `auth.json.bak`）再启动即可——那才会弹二维码。
+
+## 构建可执行文件
+
+项目使用 **[Nuitka](https://nuitka.net/)** 将 Python 源码编译打包为原生 Windows 可执行文件（standalone 模式：把 Python 解释器、全部依赖与资源文件整合进一个免安装目录，最终产出 `dist\MiHome-Windows.exe`）。Nuitka 是真编译器——把代码编译为 C 再编译为机器码，而非 PyInstaller 式的"打包字节码"，这也是需要 VS Build Tools 的原因。
+
+### 前置条件
+
+| 工具 | 版本 | 说明 |
+|------|------|------|
+| Python | >= 3.10 | 需加入系统 PATH，构建脚本会自动创建 venv |
+| C 编译器 | **MSVC（VS Build Tools / VS Community）** | 必须与 **Windows SDK** 一起装，见下 |
+| 项目路径 | **纯 ASCII** | 路径含中文会导致构建失败，见下 |
+
+**① 装 MSVC + Windows SDK（必须两个都装）**
+
+打开 **Visual Studio Installer** → 修改已装的 VS：
+
+- 「工作负载」标签 → 勾 **使用 C++ 的桌面开发**（会连带 Windows SDK）；
+- 或「单个组件」标签 → 搜 `Windows SDK` → 勾 **Windows 11 SDK (10.0.26100.0)**
+  （有 10.0.22621.0 也可以）。
+
+> 只装 MSVC 不装 SDK 时，`cl.exe` 存在、vcvars 也能"激活成功"，但编译阶段
+> 必然失败。构建脚本会**提前检查 SDK 并明确报错**。
+
+**② 项目路径必须是纯英文**
+
+Nuitka 依赖的 `depends.exe` 不支持非 ASCII 路径（会把中文写成 `0x04` 占位
+字节），构建会在依赖扫描阶段崩掉。项目目录请放在纯英文路径下，
+例如 `E:\Projects\MiHome-Windows`。构建脚本会先检查路径并提示。
+
+### 一键构建
+
+```powershell
+cd MiHome-Windows
+
+.\build.ps1
+```
+
+脚本自动完成：创建 venv → 安装依赖（含 Nuitka 本体）→ 激活 MSVC 环境 → Nuitka 编译
+→ 输出到 `dist\MiHome-Windows.exe`，并做一次**隐私自检**（确认产物里没有
+登录凭据与设备数据）。
+
+> **产物不带个人米家信息**：账号凭据、设备列表、挂件/定时配置都只存在用户目录
+> （见上节），编译时不会打进 `dist\`；隐私自检发现任何一份就报错终止。
+> 别人拿到你的 `dist\` 或安装包，仍然是他自己的账号、自己的设备。
+
+> **产物是"一个 exe + 一堆依赖目录"**，不是单文件。只拷 `MiHome-Windows.exe`
+> 到别的机器是跑不起来的，必须整个 `dist\` 目录一起分发（或做安装包，见下）。
+
+构建参数（打包资源清单、图标、排除项等）集中维护在 `build.ps1` 的 `$NuitkaArgs`；
+`build_msvc.bat` 只是转发到它的双击入口。
+
+首次构建耗时较长（创建 venv + 下载依赖 + Nuitka 编译，通常 5–15 分钟，视机器而定）
+
+
+
+## 项目结构
+
+```
+app/
+├── core/                       # 核心层
+│   ├── service.py              # mijiaAPI 适配层，全项目唯一 import mijiaAPI 的模块
+│   ├── jobs.py                 # 串行任务队列，所有米家网络调用的后台通道
+│   ├── models.py               # 数据模型
+│   ├── _json_store.py          # JSON 持久化公共基础（数据目录/迁移/原子写）
+│   ├── cache.py                # 设备缓存
+│   ├── settings_store.py       # 应用设置持久化（含开机自启动注册表）
+│   ├── tray_store.py           # 托盘配置持久化
+│   ├── workbench_store.py      # 工作台配置持久化
+│   ├── board_store.py          # 桌面挂件配置持久化（设备/列数/透明度/几何）
+│   ├── schedule_store.py       # 定时开关规则持久化
+│   ├── scheduler.py            # 定时判定（纯逻辑：到点/错过，不依赖 Qt）
+│   ├── update_checker.py       # GitHub Releases 新版本检查（后台线程 + 信号）
+│   ├── name_override_store.py  # 自定义设备名称持久化
+│   ├── name_store.py           # 产品页中文商品名缓存
+│   ├── spec_zh.py              # 属性/动作名中文兜底表
+│   ├── icon_store.py           # 设备图标 URL 与图片缓存
+│   ├── net_guard.py            # 全局网络超时兜底
+│   └── restart.py              # 应用自重启（缩放等设置需重启生效时一键重启）
+├── diagnostics.py              # 源码模式控制台输出与崩溃堆栈落盘
+├── ui/                         # 界面层
+│   ├── main_window.py          # 主窗口（无边框标题栏）
+│   ├── tray/                   # 系统托盘
+│   │   ├── quick_window.py     #   快捷控制面板（单列/双列卡片）
+│   │   ├── audio_bar.py        #   音响控制栏
+│   │   ├── controller.py       #   托盘控制器
+│   │   └── manager_dialog.py   #   托盘项目管理对话框
+│   ├── device_card.py          # 设备卡片组件（名称两行省略、电源钮）
+│   ├── device_dialog.py        # 设备详情对话框
+│   ├── rename_dialog.py        # 修改设备名称对话框
+│   ├── metrics_pick_dialog.py  # 卡片外显值选择对话框（最多两项数值属性）
+│   ├── room_order_dialog.py    # 顶部标签排序与默认标签设置
+│   ├── room_filter.py          # 房间筛选下拉（带家庭名前缀）
+│   ├── check_box.py            # 自绘复选框（主题色方块 + 对勾）
+│   ├── status_panel.py         # 环境状态明细面板（温湿度/开启设备/耗材）
+│   ├── scene_card.py           # 场景卡片组件
+│   ├── workbench_panel.py      # 工作台面板（属性/动作）
+│   ├── workbench_item.py       # 工作台属性/动作项
+│   ├── widgets_board.py        # 桌面挂件窗口（常驻置顶/拖动/透明度/折叠横条）
+│   ├── board_manager.py        # 桌面挂件管理对话框（设备/场景分页勾选 + 外观设置）
+│   ├── schedule_dialog.py      # 定时任务对话框（按设备配时间与开/关）
+│   ├── prop_widgets.py         # 属性控件（开关、滑块、下拉框）
+│   ├── power_button.py         # 三态电源按钮（卡片/托盘/详情共用）
+│   ├── overlay_dialog.py       # 遮罩对话框基类（详情/设置/抽屉共用）
+│   ├── about_dialog.py         # 关于对话框（版本信息、手动检测更新）
+│   ├── settings_dialog.py      # 设置对话框（主题界面/应用功能双分类）
+│   ├── voice_fab.py            # 语音悬浮球
+│   ├── toast.py                # 轻量通知浮层
+│   ├── update_flow.py          # 版本检查界面流程（弹框提示/静默反馈）
+│   ├── update_dialog.py        # 新版本提示对话框（渲染 Release 更新日志）
+│   ├── tooltip.py              # 全局自绘工具提示（跟随应用主题）
+│   ├── smooth_scroll.py        # 全局滚轮缓动滚动
+│   ├── login_dialog.py         # 扫码登录对话框
+│   ├── add_drawer.py           # 设备添加抽屉
+│   ├── typewriter.py           # 打字机效果组件
+│   ├── si_theme.py             # 主题中枢（深/浅调色板 + 全局 QSS 生成）
+│   ├── theme_service.py        # 主题编排（跟随系统/浅色/深色）
+│   ├── restart.py              # 应用自重启
+│   ├── icon.ico / icon.png     # 应用图标
+│   └── tray_icon.png / tray_icon_light.png  # 托盘图标
+├── siui/                       # 内置 SiliconUI 组件库（GPL-3.0）
+│   ├── components/             # UI 组件
+│   ├── core/                   # 核心工具
+│   └── gui/                    # 图形工具
+└── __init__.py                 # 版本号 + 工具函数
+
+tests/
+├── smoke_test.py               # 上游升级后的接口兼容性自检
+├── theme_test.py               # 主题切换回归（离屏像素断言）
+├── board_test.py               # 桌面挂件回归（离屏渲染/收起/透明度/管理对话框）
+├── latency_test.py             # 开关响应速度回归（队列优先级/单次写/乐观回滚）
+├── race_test.py                # 开关状态回弹回归（过期轮询不得覆盖本地操作）
+├── schedule_test.py            # 定时开关回归（到点/错过/停用/界面接线）
+├── audio_test.py               # 托盘音响栏回归（音箱下拉/独立偏好/音量渲染）
+├── update_test.py              # 版本检查与提示对话框回归（版本比较/日志渲染）
+├── dispatch_test.py            # 任务队列优先级与投递顺序回归
+└── subdevice_test.py           # 多键面板虚拟子设备的通道映射回归
+
+tools/
+└── diag_switch.py              # 只读诊断：打印云端对多键面板各 did/siid 的原始返回
+
+run.py                          # 程序入口
+start.bat                       # Windows 一键运行（双击运行）
+build_msvc.bat                  # Windows 一键构建（双击运行，转发 build.ps1）
+build.ps1                       # PowerShell 构建脚本（Nuitka 参数唯一来源）
+pyproject.toml                  # 项目配置
+LICENSE                         # GPL-3.0 许可证
+```
+
+## 依赖说明
+
+| 包名 | 版本 | 用途 |
+|------|------|------|
+| mijiaAPI | >=5,<6 | 米家 API 封装 |
+| PySide6 | >=6.7 | Qt6 绑定 |
+| qrcode | >=8 | 登录二维码生成 |
+| qtawesome | >=1.4 | Material Design 图标 |
+| numpy | - | SiliconUI 动画插值 |
+| typing_extensions | - | SiliconUI 在 Python 3.10 下所需的类型别名 |
+
+## 排查问题
+
+出问题时先看日志：
+
+- `debug.log`：结构化日志（源码模式在项目根，构建版在 `%LOCALAPPDATA%\MiHome-Windows\`），
+  记录应用内捕获到的异常、后台任务失败与云端错误码。
+- `app.log`：**仅源码模式**，把控制台原始输出与崩溃堆栈一并写入。程序崩溃时控制台窗口
+  会随进程一起消失，事后只能靠这个文件——它同时接管了 Qt 的 C++ 层警告与段错误堆栈，
+  每次启动会写一条 `===== 时间 启动 =====` 分隔线，方便区分是第几次运行。
+
+云端返回的原始错误码可用诊断脚本查看：
+
+```powershell
+.venv\Scripts\python.exe -X utf8 -m tools.diag_switch
+```
+
+常见提示说明：
+
+- 设备名显示为英文：多出现在国际版设备，程序会依次尝试规格里的中文名、产品页商品名；
+  都不存在时保持云端原名，可用详情页的自定义名称覆盖。
+- 详情页提示「该设备无公开的功能规格」：仅蓝牙类产品在云端没有下发规格，无法提供
+  控制面板。这类设备仍可正常显示与改名，不影响其它功能。
+- `开关状态读取失败 ... code=-704002000`：规格声明了开关属性但设备实际不支持，
+  属于常态，这类记录按调试级别输出，不会出现在 `debug.log` 里。
+
+
+## 开源许可
+
+本项目基于 [GPL-3.0](LICENSE) 或更高版本发布。
+
+### 第三方组件
+
+本程序使用了以下 GPL-3.0 协议的开源组件，在此向原作者致谢：
+
+- [mijia-api](https://github.com/Do1e/mijia-api) - 米家 API 封装
+- [PySide6-SiliconUI](https://github.com/H1DDENADM1N/PySide6-SiliconUI) - UI 组件库（已内置至 `app/siui/`）
+
+对本项目代码的使用、修改与分发同样须遵循 GPL-3.0。
+
+本程序不含任何担保。请自行承担使用风险，并遵守小米的服务条款。

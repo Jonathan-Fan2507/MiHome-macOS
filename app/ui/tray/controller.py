@@ -1,0 +1,350 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# MiHome-Windows: 米家设备的 Windows 桌面控制端
+# Copyright (C) 2026 MiHome-Windows contributors
+"""系统托盘控制器：常驻图标 + 菜单 + 快捷窗口编排。"""
+
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QGuiApplication,
+    QIcon,
+    QPainter,
+    QPixmap,
+)
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+from app import APP_TITLE, IS_MACOS
+from app.core.jobs import JobExecutor
+from app.core.models import DeviceInfo
+from app.core.service import MijiaService
+from app.ui.tray.quick_window import TrayQuickWindow
+
+# 单击托盘后等这么久再弹快捷窗口，给双击留出识别窗口。
+# 不用系统的双击间隔（默认 500ms）：那段时间里单击毫无反应，
+# 手感上像卡住了
+_SINGLE_CLICK_DELAY_MS = 200
+
+
+def _plain_icon(path: str) -> QIcon:
+    """按多尺寸装载原始图标，保证任务栏与高 DPI 下都清晰。"""
+    base = QPixmap(path)
+    if base.isNull():
+        return QIcon()
+    icon = QIcon()
+    for size in (16, 32, 48):
+        icon.addPixmap(base.scaled(
+            size, size, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+    return icon
+
+
+def _tinted_icon(path: str, color: str) -> QIcon:
+    """把单色图形的像素整体换成指定颜色，保留原有透明度轮廓。
+
+    托盘图标是纯白房子，直接用它当蒙版染色，就不必为每种颜色
+    各准备一套图片资源。
+    """
+    base = QPixmap(path)
+    if base.isNull():
+        # 资源缺失时返回空图标，让任务栏留空总比让程序崩掉好
+        return QIcon()
+    tinted = QPixmap(base.size())
+    tinted.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tinted)
+    painter.drawPixmap(0, 0, base)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(tinted.rect(), QColor(color))
+    painter.end()
+    icon = QIcon(tinted)
+    for size in (16, 32, 48):
+        icon.addPixmap(tinted.scaled(
+            size, size, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+    return icon
+
+
+class TrayController:
+    """托盘图标控制器：常驻图标 + 快捷窗口 + 右键菜单。"""
+
+    def __init__(self, service: MijiaService, jobs: JobExecutor, main_window):
+        self._service = service
+        self._jobs = jobs
+        self._main = main_window
+        self._pending_show = False
+        # 快捷窗口设为独立顶层窗口，不随主窗口模态对话框被阻塞
+        self._create_quick_window()
+
+        if IS_MACOS:
+            # 菜单栏用新版图标的单色简化版（模板图，系统按深浅着色）
+            from app.ui.app_icon import menubar_icon
+            _tray_icon = menubar_icon()
+        else:
+            # 使用自定义 tray_icon.png 作为托盘图标，提供多尺寸确保清晰
+            from app import resource_path
+            _icon_path = str(resource_path("app/ui/tray_icon.png"))
+            _tray_icon = QIcon(_icon_path)
+            _tray_icon.addFile(_icon_path, QSize(16, 16))
+            _tray_icon.addFile(_icon_path, QSize(32, 32))
+            _tray_icon.addFile(_icon_path, QSize(48, 48))
+        self._tray = QSystemTrayIcon(_tray_icon, main_window)
+        self._tray.setToolTip(APP_TITLE)
+        if not IS_MACOS:
+            self._tray.activated.connect(self._on_activated)
+        # 点击瞬间快捷窗口是否已呼出，决定这次单击是开还是关。
+        # 必须在点击当下取快照：托盘窗口失焦后会自动隐藏，等延迟
+        # 结束再判断就永远是"不可见"，于是只能开不能关
+        self._quick_was_visible = False
+        # 单击要推迟执行，给双击留出识别窗口。双击时系统会先发一次
+        # 单击事件，若立刻响应，快捷窗口会闪一下再被主窗口盖住
+        self._click_timer = QTimer(main_window)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._toggle_quick)
+
+        menu = QMenu()
+        menu.setProperty("appPopup", True)
+        act_show = QAction("显示主窗口", menu)
+        act_show.triggered.connect(self._show_main)
+        menu.addAction(act_show)
+        if IS_MACOS:
+            menu.addAction("快捷控制").triggered.connect(self._show_quick)
+        act_manage = QAction("管理托盘项目", menu)
+        act_manage.triggered.connect(self._emit_manage)
+        menu.addAction(act_manage)
+        # 桌面挂件：管理 + 显隐两个入口（开关在设置里）。放在定时任务之上，
+        # 与主界面「更多」菜单的顺序保持一致
+        act_board_manage = QAction("管理桌面挂件", menu)
+        act_board_manage.triggered.connect(self._on_manage_board)
+        act_board_manage.setVisible(False)
+        menu.addAction(act_board_manage)
+        self._board_manage_action = act_board_manage
+        act_board_toggle = QAction("隐藏桌面挂件", menu)
+        act_board_toggle.triggered.connect(self._toggle_board_visible)
+        act_board_toggle.setVisible(False)
+        menu.addAction(act_board_toggle)
+        self._board_toggle_action = act_board_toggle
+        act_schedule = QAction("定时任务", menu)
+        act_schedule.triggered.connect(self._on_schedules)
+        menu.addAction(act_schedule)
+        act_settings = QAction("设置", menu)
+        act_settings.triggered.connect(self._on_settings)
+        menu.addAction(act_settings)
+        menu.addSeparator()
+        act_quit = QAction("退出", menu)
+        act_quit.triggered.connect(self._quit)
+        menu.addAction(act_quit)
+        # 每次弹出前按设置刷新挂件入口：开关关掉时"管理桌面挂件"不该出现
+        menu.aboutToShow.connect(self.refresh_board_action)
+        self._tray.setContextMenu(menu)
+
+        # 快捷窗口的信号接线统一在 _create_quick_window 内做一次，
+        # 此处重复连接曾导致每次触发弹两次对话框
+
+        # 托盘图标常驻，无需可用性检查也尝试显示
+        self._tray.show()
+        # 托盘图标跟系统配色（任务栏底色由系统决定），与应用主题设置无关
+        self.apply_system_icon_theme(
+            QGuiApplication.styleHints().colorScheme())
+
+    def apply_system_icon_theme(self, scheme, choice: str | None = None) -> None:
+        """刷新托盘图标：按用户设置的颜色，默认跟随任务栏深浅。
+
+        scheme 接受 Qt.ColorScheme 或 \"dark\"/\"light\" 字符串。
+        choice 用于设置页的即时预览：此刻选择还没落盘，直接传进来
+        才能立刻看到效果；不传则读已保存的设置。
+        """
+        if isinstance(scheme, str):
+            is_light = scheme == "light"
+        else:
+            is_light = scheme == Qt.ColorScheme.Light
+        from app.core import settings_store
+
+        if choice is None:
+            choice = settings_store.get_tray_icon_color()
+        if IS_MACOS:
+            # 「跟随系统」= 模板图，浅色/深色菜单栏与高亮态都由 macOS 自动着色；
+            # 固定颜色时按色染同一个单色字形
+            from app.ui.app_icon import menubar_icon
+            fixed = None if choice == "system" else (
+                choice if choice.startswith("#")
+                else settings_store.TRAY_ICON_COLORS.get(choice, "#ffffff"))
+            self._tray.setIcon(menubar_icon(fixed))
+            return
+        if choice == "system":
+            # 浅色任务栏配深色图形，反之亦然
+            icon_file = ("app/ui/tray_icon_light.png" if is_light
+                         else "app/ui/tray_icon.png")
+            color = None
+        else:
+            # 固定颜色统一以白色图形为底再染色，避免两套底图颜色不一致；
+            # 自定义色直接就是 #rrggbb，预设名则查表换算
+            icon_file = "app/ui/tray_icon.png"
+            color = (choice if choice.startswith("#")
+                     else settings_store.TRAY_ICON_COLORS.get(choice, "#ffffff"))
+        from app import resource_path
+        path = str(resource_path(icon_file))
+        icon = (_tinted_icon(path, color) if color
+                else _plain_icon(path))
+        self._tray.setIcon(icon)
+
+    def _create_quick_window(self) -> None:
+        """创建快捷窗口并接线；主题切换时整窗重建复用。"""
+        self._quick = TrayQuickWindow(self._service, self._jobs, None)
+        self._quick.manage_requested.connect(self._on_manage)
+        self._quick.open_device_requested.connect(self._on_open_device)
+        self._quick.open_main_requested.connect(self._show_main)
+
+    def _emit_manage(self) -> None:
+        # 经方法转发而非构造期绑定信号：retheme 重建窗口后菜单仍指向新窗口
+        self._quick.manage_requested.emit()
+
+    def _on_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            # 双击直接开主窗口：单击的延迟任务要取消掉，否则快捷窗口
+            # 会在主窗口出现后又弹出来
+            self._click_timer.stop()
+            self._show_main()
+            return
+        if reason != QSystemTrayIcon.ActivationReason.Trigger:
+            return
+        self._quick_was_visible = self._quick.is_explicitly_visible()
+        self._click_timer.start(_SINGLE_CLICK_DELAY_MS)
+
+    def _show_quick(self) -> None:
+        self._quick.show_near_tray()
+
+    def _toggle_quick(self) -> None:
+        """左键单击托盘：按点击瞬间的状态决定呼出还是收起。"""
+        quick = self._quick
+        # 正在播放呼出/隐藏动画时先终止旧动画，避免直接 hide 丢失关闭动画
+        if quick.is_animating():
+            quick.abort_toggle_animation()
+        if self._quick_was_visible:
+            quick.hide_animated()
+        else:
+            quick.show_near_tray()
+
+    def _show_main(self) -> None:
+        # 快捷窗口是置顶的 Tool 窗口，主窗口起来后它会浮在上面挡视线，
+        # 各入口（右键菜单、快捷窗口内的按钮、双击托盘）都先收起它
+        if self._quick.isVisible() or self._quick.is_explicitly_visible():
+            self._quick.hide_animated()
+        # 先解除最小化再显示：show() 之后再判断状态可能已经变了，
+        # 最小化的窗口会停在任务栏里不动
+        if self._main.isMinimized():
+            self._main.showNormal()
+        self._main.show()
+        self._main.raise_()
+        self._main.activateWindow()
+
+    def _quit(self) -> None:
+        self._tray.hide()
+        # 标记为强制退出，避免 closeEvent 拦截为隐藏到托盘
+        self._main.request_force_quit()
+        self._main.close()
+        # quitOnLastWindowClosed 为 False 时需显式退出事件循环
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _on_manage(self) -> None:
+        self._main.show_tray_manager()
+
+    def _on_schedules(self) -> None:
+        self._main.show_schedules()
+
+    # ---- 桌面挂件 ----
+
+    def refresh_board_action(self) -> None:
+        """按设置里的「桌面挂件」开关决定管理入口是否出现。"""
+        from app.core import board_store
+
+        self.set_board_enabled(board_store.get_enabled())
+
+    def set_board_enabled(self, enabled: bool) -> None:
+        """挂件开关关闭时收起管理/显隐入口；开启时按当前显隐取文案。"""
+        action = getattr(self, "_board_manage_action", None)
+        if action is not None:
+            action.setVisible(bool(enabled))
+        toggle = getattr(self, "_board_toggle_action", None)
+        if toggle is not None:
+            # 挂件构造失败时显隐项没有意义
+            toggle.setVisible(bool(enabled) and self._board_exists())
+            if enabled:
+                toggle.setText(
+                    "隐藏桌面挂件" if self._board_visible() else "显示桌面挂件")
+
+    def _board_exists(self) -> bool:
+        return getattr(self._main, "_board", None) is not None
+
+    def _board_visible(self) -> bool:
+        board = getattr(self._main, "_board", None)
+        return board is not None and board.isVisible()
+
+    def _toggle_board_visible(self) -> None:
+        self._main.toggle_board_visible()
+
+    def _on_manage_board(self) -> None:
+        self._main.show_board_manager()
+
+    def _on_settings(self) -> None:
+        self._main.show_settings()
+
+    def _on_open_device(self, did: str) -> None:
+        # 仅打开设备详情，不呼出主窗口，避免主窗口隐藏时卡死
+        self._quick.hide()
+        # 直接创建详情对话框，parent 设为 None 使其独立于主窗口显隐
+        dev = next((d for d in self._main.devices() if d.did == did), None)
+        if dev is None:
+            return
+        from app.ui.device_dialog import DeviceDetailDialog
+        dlg = DeviceDetailDialog(self._service, self._jobs, dev, None)
+        dlg.load()
+        dlg.exec()
+        dlg.deleteLater()
+
+    def set_devices(self, devices: list[DeviceInfo], known_power: dict[str, bool | None]) -> None:
+        self._quick.set_devices(devices, known_power)
+
+    def set_metrics(self, metrics: dict[str, str | None]) -> None:
+        self._quick.set_metrics(metrics)
+        if self._pending_show:
+            # 重建前窗口正显示着：设备填充完毕后再呼出，避免空窗口闪现
+            self._pending_show = False
+            self._quick.show_near_tray()
+
+    def retheme(self) -> None:
+        """主题切换：整个快捷窗口重建。
+
+        快捷窗口的内联样式散布在窗框/音频栏/语音条/设备行/工具条
+        多处，逐控件补样式总有遗漏（曾反复出现新旧色混杂残留）；
+        整窗重建让全部样式天然取新调色板。设备与开关状态由主窗口
+        在本调用之后立刻 set_devices 推送，显示状态在此登记。
+        """
+        was_visible = self._quick.isVisible() or self._quick.is_explicitly_visible()
+        self._quick.abort_toggle_animation()
+        self._quick.hide()
+        self._quick.deleteLater()
+        self._create_quick_window()
+        self._pending_show = was_visible
+
+    def hide_quick(self) -> None:
+        self._quick.hide()
+
+    def notify(self, title: str, text: str) -> None:
+        """托盘气泡 / 系统通知（macOS 进通知中心）；图标被隐藏时不弹。"""
+        if self._tray.isVisible():
+            self._tray.showMessage(
+                title, text, QSystemTrayIcon.MessageIcon.Warning, 8000)
+
+    def set_tray_visible(self, visible: bool) -> None:
+        """按设置开关托盘图标显隐：开启时常驻图标可见，关闭时隐藏。"""
+        try:
+            self._tray.setVisible(visible)
+        except Exception:
+            pass
+
+    def is_available(self) -> bool:
+        return QSystemTrayIcon.isSystemTrayAvailable()
+
