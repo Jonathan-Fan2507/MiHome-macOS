@@ -11,13 +11,17 @@
 
 使用 macOS 原生窗口边框。开启设置里的系统托盘后，可从菜单栏米家图标选择「显示主窗口」或「快捷控制」。首次使用时，用手机米家 App 扫描登录二维码。
 
-在 macOS 上从源码运行（Python 3.10 或更新版本）：
+在 Mac 上首次使用，请先安装 [Python 3.10 或更新版本](https://www.python.org/downloads/macos/)，然后在终端运行：
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/python run.py
+git clone https://github.com/Jonathan-Fan2507/MiHome-macOS.git
+cd MiHome-macOS
+bash start-macos.sh
 ```
+
+启动脚本会在项目目录创建独立的 Python 环境并安装依赖。首次安装需要连接 PyPI，启动后用自己的米家账号扫码即可。之后在同一目录再次运行 `bash start-macos.sh`。下载 ZIP 的用户可以解压后进入项目目录，从启动命令开始。
+
+主窗口、设备管理和菜单栏快捷控制可以从源码运行，无需 Apple 开发者证书。系统控制中心的「米家设备开关」需要 macOS 26 或更新版本和带签名的应用扩展，构建方法见下文。
 
 构建当前架构的 `dist/MiHome.app`：
 
